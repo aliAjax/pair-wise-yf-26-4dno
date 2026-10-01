@@ -144,8 +144,31 @@ class PreservationStore:
                     detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS transfers(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    from_owner_id TEXT NOT NULL REFERENCES users(id),
+                    to_owner_id TEXT NOT NULL REFERENCES users(id),
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','completed','invalidated')),
+                    retention_until TEXT NOT NULL,
+                    blocking TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_transfers_one_pending
+                    ON transfers(archive_id) WHERE status='pending';
+                CREATE TABLE IF NOT EXISTS transfer_copies(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transfer_id INTEGER NOT NULL REFERENCES transfers(id),
+                    copy_id INTEGER NOT NULL REFERENCES copies(id),
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','confirmed')),
+                    confirmed_by TEXT REFERENCES users(id),
+                    confirmed_at TEXT,
+                    UNIQUE(transfer_id,copy_id)
+                );
                 """
             )
+        self.backfill_transfers()
 
     def seed(self) -> None:
         self.init_schema()
@@ -179,8 +202,14 @@ class PreservationStore:
         row = conn.execute(
             "SELECT permission FROM archive_members WHERE archive_id=? AND user_id=?", (archive_id, user["id"])
         ).fetchone()
-        if not row or (require_write and row["permission"] != "write"):
-            raise BusinessError("没有该受限档案的访问权限", 403, "forbidden")
+        if row and (not require_write or row["permission"] == "write"):
+            return
+        # 移交期间接收机构仍可查看/校验副本（确认副本需要读权限）
+        if not require_write and self._pending_transfer(conn, archive_id) and \
+                conn.execute("SELECT id FROM transfers WHERE archive_id=? AND status='pending' AND to_owner_id=?",
+                             (archive_id, user["id"])).fetchone():
+            return
+        raise BusinessError("没有该受限档案的访问权限", 403, "forbidden")
 
     def _audit(self, conn, archive_id: int, actor: str, action: str, detail: dict) -> None:
         conn.execute(
@@ -240,6 +269,7 @@ class PreservationStore:
             self._access(conn, archive_id, actor, require_write=True)
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                self._assert_transfer_allows_writes(conn, archive_id)
                 version_no = conn.execute(
                     "SELECT COALESCE(MAX(version),0)+1 FROM archive_versions WHERE archive_id=?", (archive_id,)
                 ).fetchone()[0]
@@ -275,6 +305,7 @@ class PreservationStore:
             self._access(conn, version["archive_id"], actor, require_write=True)
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                self._assert_transfer_allows_writes(conn, version["archive_id"])
                 cur = conn.execute(
                     "INSERT INTO copies(version_id,location,created_at,last_verified_at) VALUES(?,?,?,?)",
                     (version_id, location, now(), now()),
@@ -356,6 +387,18 @@ class PreservationStore:
                             repaired, result_state = True, "healthy"
                     if result_state == "degraded":
                         conn.execute("UPDATE archive_versions SET state='degraded' WHERE id=?", (copy["version_id"],))
+                if corrupt_paths and result_state != "healthy":
+                    t = self._pending_transfer(conn, version["archive_id"])
+                    if t:
+                        blockers = [f"副本 {copy_id} 校验损坏: {p}" for p in corrupt_paths]
+                        conn.execute(
+                            "UPDATE transfers SET status='invalidated', blocking=? WHERE id=?",
+                            (json.dumps(blockers, ensure_ascii=False), t["id"]),
+                        )
+                        self._audit(
+                            conn, version["archive_id"], user_id, "transfer.invalidate",
+                            {"transfer_id": t["id"], "blockers": blockers},
+                        )
                 self._audit(
                     conn, version["archive_id"], user_id, "copy.verify",
                     {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired},
@@ -398,6 +441,7 @@ class PreservationStore:
             converted = verify_manifest([{"path": target_path, "content_b64": content_b64}])[0]
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                self._assert_transfer_allows_writes(conn, source_version["archive_id"])
                 version_no = conn.execute(
                     "SELECT COALESCE(MAX(version),0)+1 FROM archive_versions WHERE archive_id=?", (source_version["archive_id"],)
                 ).fetchone()[0]
@@ -445,6 +489,274 @@ class PreservationStore:
                              for v in versions],
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
             }
+
+    # ---- 移交批次（机构合库） ----
+
+    def _pending_transfer(self, conn, archive_id: int):
+        return conn.execute(
+            "SELECT * FROM transfers WHERE archive_id=? AND status='pending'", (archive_id,)
+        ).fetchone()
+
+    def _assert_transfer_allows_writes(self, conn, archive_id: int) -> None:
+        """移交未完成前，原机构仍可查看，但冻结新建版本/副本/移除副本。"""
+        if self._pending_transfer(conn, archive_id):
+            raise BusinessError("档案移交期间冻结变更：请待移交完成或失效后再操作", 409, "transfer_in_progress")
+
+    def _copy_corrupt_paths(self, conn, copy_id: int) -> list[str]:
+        rows = conn.execute(
+            "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (copy_id,)
+        ).fetchall()
+        return [
+            r["path"] for r in rows
+            if hashlib.sha256(r["content"]).hexdigest() != r["sha256"] or len(r["content"]) != r["size"]
+        ]
+
+    def _invalidate_transfer(self, conn, archive_id: int, transfer_id: int, blockers: list[str], actor_id: str) -> None:
+        conn.execute(
+            "UPDATE transfers SET status='invalidated', blocking=? WHERE id=?",
+            (json.dumps(blockers, ensure_ascii=False), transfer_id),
+        )
+        self._audit(conn, archive_id, actor_id, "transfer.invalidate", {"transfer_id": transfer_id, "blockers": blockers})
+
+    def _transfer_detail(self, conn, transfer_id: int) -> dict:
+        t = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
+        if not t:
+            raise BusinessError("移交批次不存在", 404, "not_found")
+        copies = conn.execute(
+            """SELECT tc.id, tc.copy_id, tc.status, tc.confirmed_by, tc.confirmed_at, c.location
+               FROM transfer_copies tc JOIN copies c ON tc.copy_id=c.id
+               WHERE tc.transfer_id=? ORDER BY tc.id""",
+            (transfer_id,),
+        ).fetchall()
+        d = dict(t)
+        d["blocking"] = json.loads(d["blocking"]) if d.get("blocking") else []
+        d["copies"] = [dict(c) for c in copies]
+        d["confirmed_count"] = sum(1 for c in copies if c["status"] == "confirmed")
+        d["total_count"] = len(copies)
+        return d
+
+    def backfill_transfers(self) -> dict:
+        """旧数据缺少移交批次时，按档案升级成单件批次（保管权归属当前机构，副本视为已确认）。"""
+        created = 0
+        with self.connect() as conn:
+            archives = conn.execute("SELECT id FROM archives").fetchall()
+            for a in archives:
+                if conn.execute("SELECT id FROM transfers WHERE archive_id=?", (a["id"],)).fetchone():
+                    continue
+                archive = conn.execute("SELECT * FROM archives WHERE id=?", (a["id"],)).fetchone()
+                cur = conn.execute(
+                    """INSERT INTO transfers(archive_id,from_owner_id,to_owner_id,status,retention_until,created_at,completed_at)
+                       VALUES(?,?,?,'completed',?,?,?)""",
+                    (a["id"], archive["owner_id"], archive["owner_id"], archive["retention_until"], now(), now()),
+                )
+                transfer_id = cur.lastrowid
+                copy_ids = conn.execute(
+                    "SELECT c.id FROM copies c JOIN archive_versions v ON c.version_id=v.id WHERE v.archive_id=?",
+                    (a["id"],),
+                ).fetchall()
+                for c in copy_ids:
+                    conn.execute(
+                        """INSERT INTO transfer_copies(transfer_id,copy_id,status,confirmed_by,confirmed_at)
+                           VALUES(?,?, 'confirmed',?,?)""",
+                        (transfer_id, c["id"], archive["owner_id"], now()),
+                    )
+                created += 1
+        return {"backfilled": created}
+
+    def initiate_transfer(self, actor_id: str, archive_id: int, to_owner_id: str) -> dict:
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            self._access(conn, archive_id, actor, require_write=True)
+            to_owner = conn.execute("SELECT * FROM users WHERE id=?", (to_owner_id,)).fetchone()
+            if not to_owner:
+                raise BusinessError("接收机构用户不存在", 404, "not_found")
+            if to_owner_id == archive["owner_id"]:
+                raise BusinessError("不能向本机构发起移交", 422, "invalid_transfer_target")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                # 先到先得：部分唯一索引保证同一档案同时只有一个未完成批次，后到者撞唯一约束看到冲突
+                cur = conn.execute(
+                    """INSERT INTO transfers(archive_id,from_owner_id,to_owner_id,status,retention_until,created_at)
+                       VALUES(?,?,?,'pending',?,?)""",
+                    (archive_id, archive["owner_id"], to_owner_id, archive["retention_until"], now()),
+                )
+                transfer_id = cur.lastrowid
+                copy_rows = conn.execute(
+                    """SELECT c.id FROM copies c JOIN archive_versions v ON c.version_id=v.id
+                       WHERE v.archive_id=? ORDER BY c.id""",
+                    (archive_id,),
+                ).fetchall()
+                for c in copy_rows:
+                    conn.execute(
+                        "INSERT INTO transfer_copies(transfer_id,copy_id,status) VALUES(?,?, 'pending')",
+                        (transfer_id, c["id"]),
+                    )
+                self._audit(
+                    conn, archive_id, actor_id, "transfer.initiate",
+                    {"transfer_id": transfer_id, "to_owner_id": to_owner_id, "copies": len(copy_rows)},
+                )
+                return self._transfer_detail(conn, transfer_id)
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                raise BusinessError("该档案已有进行中的移交批次，不能重复发起", 409, "transfer_conflict")
+            except Exception:
+                conn.rollback()
+                raise
+
+    def confirm_transfer(self, actor_id: str, transfer_id: int) -> dict:
+        """接收机构逐份确认副本；每个副本独立提交（断点），失败后已确认的不重做。"""
+        conn = self.connect()
+        try:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            transfer = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
+            if not transfer:
+                raise BusinessError("移交批次不存在", 404, "not_found")
+            if transfer["status"] != "pending":
+                raise BusinessError(f"移交批次已{transfer['status']}，不能确认副本", 409, "transfer_not_pending")
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (transfer["archive_id"],)).fetchone()
+            if actor_id != transfer["to_owner_id"] and archive["owner_id"] != actor_id:
+                raise BusinessError("只有接收机构可以确认副本", 403, "forbidden")
+            # 保留期限变化 → 批次立即失效
+            if archive["retention_until"] != transfer["retention_until"]:
+                blockers = [f"保留期限由 {transfer['retention_until']} 变更为 {archive['retention_until']}"]
+                self._invalidate_transfer(conn, archive["id"], transfer_id, blockers, actor_id)
+                conn.commit()
+                return self._transfer_detail(conn, transfer_id)
+            pending_rows = conn.execute(
+                "SELECT * FROM transfer_copies WHERE transfer_id=? AND status='pending' ORDER BY id",
+                (transfer_id,),
+            ).fetchall()
+            for tc in pending_rows:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    fresh = conn.execute("SELECT * FROM transfer_copies WHERE id=?", (tc["id"],)).fetchone()
+                    if fresh["status"] == "confirmed":
+                        conn.commit()
+                        continue
+                    corrupt = self._copy_corrupt_paths(conn, fresh["copy_id"])
+                    if corrupt:
+                        blockers = [f"副本 {fresh['copy_id']} 校验损坏: {p}" for p in corrupt]
+                        conn.execute("UPDATE copies SET state='corrupt',last_verified_at=? WHERE id=?", (now(), fresh["copy_id"]))
+                        self._invalidate_transfer(conn, archive["id"], transfer_id, blockers, actor_id)
+                        conn.commit()
+                        return self._transfer_detail(conn, transfer_id)
+                    conn.execute(
+                        "UPDATE transfer_copies SET status='confirmed',confirmed_by=?,confirmed_at=? WHERE id=?",
+                        (actor_id, now(), fresh["id"]),
+                    )
+                    conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), fresh["copy_id"]))
+                    self._audit(
+                        conn, archive["id"], actor_id, "transfer.copy_confirm",
+                        {"transfer_id": transfer_id, "copy_id": fresh["copy_id"]},
+                    )
+                    conn.commit()  # 断点：每个副本的确认独立落盘，后续失败不影响已确认项
+                except Exception:
+                    conn.rollback()
+                    raise
+            # 全部副本验过 → 更换保管权
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                left = conn.execute(
+                    "SELECT COUNT(*) FROM transfer_copies WHERE transfer_id=? AND status='pending'", (transfer_id,)
+                ).fetchone()[0]
+                if left == 0:
+                    conn.execute("UPDATE archives SET owner_id=? WHERE id=?", (transfer["to_owner_id"], archive["id"]))
+                    conn.execute(
+                        "UPDATE transfers SET status='completed',completed_at=? WHERE id=?", (now(), transfer_id)
+                    )
+                    self._audit(
+                        conn, archive["id"], actor_id, "transfer.complete",
+                        {"transfer_id": transfer_id, "to_owner_id": transfer["to_owner_id"]},
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return self._transfer_detail(conn, transfer_id)
+        finally:
+            conn.close()
+
+    def list_transfers(self, user_id: str, archive_id: int) -> list[dict]:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            self._access(conn, archive_id, user)
+            rows = conn.execute("SELECT id FROM transfers WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()
+            return [self._transfer_detail(conn, r["id"]) for r in rows]
+
+    def get_transfer(self, user_id: str, transfer_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            t = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
+            if not t:
+                raise BusinessError("移交批次不存在", 404, "not_found")
+            self._access(conn, t["archive_id"], user)
+            return self._transfer_detail(conn, transfer_id)
+
+    def update_retention(self, actor_id: str, archive_id: int, retention_until: str) -> dict:
+        try:
+            deadline = date.fromisoformat(retention_until)
+        except ValueError:
+            raise BusinessError("retention_until 必须是 YYYY-MM-DD", 422, "invalid_retention")
+        if deadline < date.today():
+            raise BusinessError("保留期限不能早于今天", 422, "retention_in_past")
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            if archive["owner_id"] != actor_id:
+                raise BusinessError("只有档案所有者可以变更保留期限", 403, "forbidden")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                old = archive["retention_until"]
+                conn.execute("UPDATE archives SET retention_until=? WHERE id=?", (retention_until, archive_id))
+                blockers = []
+                t = self._pending_transfer(conn, archive_id)
+                if t and t["retention_until"] != retention_until:
+                    blockers = [f"保留期限由 {t['retention_until']} 变更为 {retention_until}"]
+                    conn.execute(
+                        "UPDATE transfers SET status='invalidated', blocking=? WHERE id=?",
+                        (json.dumps(blockers, ensure_ascii=False), t["id"]),
+                    )
+                self._audit(
+                    conn, archive_id, actor_id, "archive.retention_update",
+                    {"old": old, "new": retention_until, "invalidated": bool(blockers), "blockers": blockers},
+                )
+                return {"archive_id": archive_id, "retention_until": retention_until,
+                        "invalidated": bool(blockers), "blockers": blockers}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def remove_copy(self, actor_id: str, copy_id: int) -> dict:
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
+            if not copy:
+                raise BusinessError("副本不存在", 404, "not_found")
+            version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+            self._access(conn, version["archive_id"], actor, require_write=True)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_transfer_allows_writes(conn, version["archive_id"])
+                conn.execute("DELETE FROM copy_files WHERE copy_id=?", (copy_id,))
+                conn.execute("DELETE FROM copies WHERE id=?", (copy_id,))
+                healthy = conn.execute(
+                    "SELECT COUNT(*) FROM copies WHERE version_id=? AND state='healthy'", (version_id,)
+                ).fetchone()[0]
+                if healthy == 0:
+                    conn.execute("UPDATE archive_versions SET state='degraded' WHERE id=?", (version_id,))
+                self._audit(
+                    conn, version["archive_id"], actor_id, "copy.remove",
+                    {"copy_id": copy_id, "location": copy["location"]},
+                )
+                return {"id": copy_id, "removed": True}
+            except Exception:
+                conn.rollback()
+                raise
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -509,6 +821,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(201, store.migrate(user, int(parts[2]), d.get("source_path", ""), d.get("target_path", ""), d.get("target_format", ""), d.get("content_b64", "")))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "verify" and method == "POST":
             return self._send(200, store.verify_copy(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "remove" and method == "POST":
+            return self._send(200, store.remove_copy(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "transfers" and method == "POST":
+            d = self._body()
+            return self._send(201, store.initiate_transfer(user, int(parts[2]), d.get("to_owner_id", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "transfers" and method == "GET":
+            return self._send(200, store.list_transfers(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "retention" and method == "POST":
+            d = self._body()
+            return self._send(200, store.update_retention(user, int(parts[2]), d.get("retention_until", "")))
+        if len(parts) == 3 and parts[:2] == ["api", "transfers"] and method == "GET":
+            return self._send(200, store.get_transfer(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "transfers"] and parts[3] == "confirm" and method == "POST":
+            return self._send(200, store.confirm_transfer(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
             d = self._body()
             return self._send(200, store.simulate_corruption(user, int(parts[2]), d.get("path", "")))
